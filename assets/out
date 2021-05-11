@@ -67,6 +67,7 @@ build_args=$(jq -r '.params.build_args // {}' < $payload)
 build_args_file=$(jq -r '.params.build_args_file // ""' < $payload)
 labels=$(jq -r '.params.labels // {}' < $payload)
 labels_file=$(jq -r '.params.labels_file // ""' < $payload)
+buildx_platforms=$(jq -r '.params.buildx_platforms // "linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v6"' < $payload)
 
 
 tag_name=""
@@ -147,9 +148,7 @@ elif [ -n "$build" ]; then
   cache_from_args=()
 
   if [ "$cache" = "true" ]; then
-    if docker_pull "${repository}:${cache_tag}"; then
-      cache_from_args+=("--cache-from ${repository}:${cache_tag}")
-    fi
+    cache_from_args+=("--cache-from ${repository}:${cache_tag}")
   fi
 
   if [ -n "$cache_from" ]; then
@@ -161,6 +160,20 @@ elif [ -n "$build" ]; then
   fi
 
   cache_from="${cache_from_args[@]}"
+
+  tag_args=("-t ${repository}:${tag_name}")
+
+  if [ "$need_tag_as_latest" = "true" ] && [ "${tag_name}" != "latest"  ]; then
+    tag_args+=("-t ${repository}:latest")
+  fi
+
+  if [ -n "$additional_tag_names" ]    ; then
+    for additional_tag in $additional_tag_names; do
+      tag_args+=("-t ${repository}:${additional_tag}")
+    done
+  fi
+
+  tags="${tag_args[@]}"
 
   expanded_build_args=()
 
@@ -244,10 +257,19 @@ elif [ -n "$build" ]; then
     done
   fi
 
-  # NOTE: deactivate amazon-ecr-credential-helper so that builds go through with the DOCKER_BUILDKIT set
-  cat <<< "$(jq 'del(.credsStore)' ~/.docker/config.json)" > ~/.docker/config.json
-  docker build -t "${repository}:${tag_name}" "${target[@]}" "${expanded_build_args[@]}" "${expanded_labels[@]}" "${ssh_args[@]}" -f "$dockerfile" $cache_from "$build"
-  log_in "$username" "$password" "$registry" # This restores the credsStore: ecr-login to config.json if needed
+  docker buildx create --use
+  docker buildx inspect --bootstrap
+
+  docker buildx build \
+    --platform "${buildx_platforms}" \
+    $tags \
+    "${target[@]}" \
+    "${expanded_build_args[@]}" \
+    "${expanded_labels[@]}" \
+    -f "$dockerfile" \
+    $cache_from \
+    "$build" \
+    --push
 
 elif [ -n "$load_file" ]; then
   if [ -n "$load_repository" ]; then
@@ -269,40 +291,8 @@ fi
 
 image_id="$(image_from_tag "$repository" "$tag_name")"
 
-# afaict there's no clean way to get the digest after a push. docker prints
-# this line at the end at least:
-#
-#   (tagname): digest: (digest) size: (size)
-#
-# so just parse it out
-
-# careful to not let 'tee' mask exit status
-
-{
-  if ! docker push "${repository}:${tag_name}"; then
-    touch /tmp/push-failed
-  fi
-} | tee push-output
-
-if [ -e /tmp/push-failed ]; then
-  exit 1
-fi
-
-digest="$(grep 'digest' push-output | awk '{print $3}')"
-
-if [ "$need_tag_as_latest" = "true" ] && [ "${tag_name}" != "latest"  ]; then
-  docker tag "${repository}:${tag_name}" "${repository}:latest"
-  docker push "${repository}:latest"
-  echo "${repository}:${tag_name} tagged as latest"
-fi
-
-if [ -n "$additional_tag_names" ]    ; then
-  for additional_tag in $additional_tag_names; do
-    docker tag "${repository}:${tag_name}" "${repository}:${additional_tag}"
-    docker push "${repository}:${additional_tag}"
-    echo "${repository}:${tag_name} tagged as ${additional_tag}"
-  done
-fi
+docker pull "${repository}:${tag_name}"
+digest="$(docker inspect --format='{{index .RepoDigests 0}}' "${repository}:${tag_name}" | sed -e "s%^.*@%%")"
 
 jq -n "{
   version: {
