@@ -257,6 +257,11 @@ elif [ -n "$build" ]; then
     done
   fi
 
+  # Register QEMU with kernel to emulate other architectures.
+  # Using upstream QEMU avoids build failures present with
+  # docker's built-in emulation (forked QEMU).
+  docker run --rm --privileged linuxkit/binfmt
+
   docker buildx create --use
   docker buildx inspect --bootstrap
 
